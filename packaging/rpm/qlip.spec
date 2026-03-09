@@ -37,5 +37,5 @@ for settings and quick capture.
 %{_datadir}/icons/hicolor/scalable/apps/qlip.svg
 
 %changelog
-* Thu Jan 01 2025 Max Alt - 1.0.0-1
+* Monday March 9 Max Alt - 1.0.0-1
 - Initial release
