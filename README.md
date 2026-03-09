@@ -60,4 +60,7 @@ Build files for AUR, Debian (.deb), and RPM are in `packaging/`.
 
 ## License
 
-MIT
+GPL-3.0-or-later
+
+---
+
