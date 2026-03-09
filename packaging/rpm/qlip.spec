@@ -1,5 +1,5 @@
 Name:           qlip
-Version:        1.0.0
+Version:        1.0.1
 Release:        1%{?dist}
 Summary:        Lightweight screenshot utility for linux
 License:        GPL-3.0-or-later
