@@ -1,0 +1,16 @@
+Source: qlip
+Section: graphics
+Priority: optional
+Maintainer: Your Name <your@email.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.0
+Homepage: https://github.com/OWNER/qlip
+
+Package: qlip
+Architecture: all
+Depends: python3 (>= 3.8), python3-tk, ${misc:Depends}
+Recommends: maim, slop, xdotool, x11-xserver-utils, grim, slurp, wmctrl, wlr-randr
+Description: Lightweight screenshot utility for X11 and Wayland
+ qlip captures screenshots with support for multi-monitor full-screen,
+ interactive region selection, and per-window capture. Auto-detects
+ X11 or Wayland session. Includes a GUI for settings and quick capture.

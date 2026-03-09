@@ -1,0 +1,52 @@
+.TH QLIP 1 "2025" "qlip 1.0.0" "User Commands"
+.SH NAME
+qlip \- lightweight screenshot utility
+.SH SYNOPSIS
+.B qlip
+[\fB\-a\fR|\fB\-p\fR|\fB\-w\fR] [\fB\-m\fR [\fINUMBERS\fR]] [\fB\-c\fR] [\fB\-s\fR]
+.br
+.B qlip gui
+.SH DESCRIPTION
+.B qlip
+captures screenshots on X11 and Wayland Linux desktops. It supports
+full-screen, region-select, and per-window capture across multiple monitors.
+The display server is auto-detected at runtime.
+.SH OPTIONS
+.TP
+.B \-a
+Capture the entire screen (all connected monitors). Each monitor is saved
+as a separate file.
+.TP
+.B \-a \-m
+Capture only the monitor containing the currently active window.
+.TP
+.B \-a \-m \fINUMBERS\fR
+Capture only the specified monitors. Numbers are concatenated digits,
+e.g. \fB\-m 13\fR captures monitors 1 and 3.
+.TP
+.B \-p
+Interactively select a rectangular region to capture.
+.TP
+.B \-w
+Open a window-selection dialog and capture the chosen window.
+.TP
+.B \-w \-c
+Capture the currently active/focused window without prompting.
+.TP
+.B \-s
+Prompt for a save directory (one-time; does not change the default).
+.TP
+.B gui
+Open the graphical settings and capture interface.
+.SH FILES
+.TP
+.I ~/.config/qlip/config.json
+User configuration (save directory, filetype, filename template).
+.SH DEPENDENCIES
+.SS X11
+maim, slop, xdotool, xrandr, python3-tkinter. Optional: wmctrl.
+.SS Wayland
+grim, slurp, python3-tkinter. One of: swaymsg (sway), hyprctl (Hyprland),
+or wlr-randr (generic wlroots).
+.SH AUTHOR
+qlip contributors.

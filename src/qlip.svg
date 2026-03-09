@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- White rounded-square background -->
+  <rect width="256" height="256" rx="40" fill="#ffffff" stroke="#e0e0e0" stroke-width="1"/>
+  <!-- Q body: square ring -->
+  <path d="
+    M 56 48 h 144 a 8 8 0 0 1 8 8 v 144 a 8 8 0 0 1 -8 8 h -144 a 8 8 0 0 1 -8 -8 v -144 a 8 8 0 0 1 8 -8 z
+    M 88 80 v 88 h 80 v -88 z
+  " fill="#111111" fill-rule="evenodd"/>
+  <!-- Q tail: angled bar extending from bottom-right of ring -->
+  <polygon points="148,168 168,148 224,204 204,224" fill="#111111"/>
+</svg>

@@ -1,0 +1,1319 @@
+#!/usr/bin/env python3
+"""qlip - lightweight screenshot utility for Linux (X11 + Wayland)"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "qlip"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+DEFAULT_CONFIG = {
+    "save_dir": str(Path.home() / "Pictures" / "Screenshots"),
+    "ask_save_location": False,
+    "filetype": "png",
+    "filename_template": "screenshot-%Y-%m-%d_%H%M%S",
+    "include_cursor": False,
+    "theme": "auto",
+}
+
+
+# ── Session / backend detection ──────────────────────────────────
+
+_detected_backend = None
+
+
+def detect_backend():
+    global _detected_backend
+    if _detected_backend is not None:
+        return _detected_backend
+
+    session = os.environ.get("XDG_SESSION_TYPE", "")
+
+    if session == "wayland":
+        if _which("grim"):
+            try:
+                subprocess.run(["grim", "-g", "0,0 1x1", "/dev/null"],
+                               check=True, capture_output=True, timeout=3)
+                _detected_backend = "wayland"
+                return _detected_backend
+            except Exception:
+                pass
+        if _test_gnome_dbus():
+            _detected_backend = "portal"
+            return _detected_backend
+
+    _detected_backend = "x11"
+    return _detected_backend
+
+
+def _test_gnome_dbus():
+    try:
+        result = subprocess.run(
+            ["dbus-send", "--session", "--print-reply",
+             "--dest=org.gnome.Shell.Screenshot",
+             "/org/gnome/Shell/Screenshot",
+             "org.freedesktop.DBus.Peer.Ping"],
+            capture_output=True, timeout=3
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _which(cmd):
+    return shutil.which(cmd) is not None
+
+
+def check_deps():
+    be = detect_backend()
+    if be == "wayland":
+        needed = {"grim": "grim", "slurp": "slurp"}
+        nice = {"swaymsg": "sway", "hyprctl": "hyprland",
+                "wlr-randr": "wlr-randr (fallback monitor listing)"}
+    elif be == "portal":
+        needed = {}
+        nice = {"xrandr": "xrandr (monitor enumeration)"}
+    else:
+        needed = {"maim": "maim"}
+        nice = {"xdotool": "xdotool", "xrandr": "xrandr",
+                "wmctrl": "wmctrl (optional)"}
+    missing = [v for k, v in needed.items() if not _which(k)]
+    if missing:
+        print(f"Error: missing required tools: {', '.join(missing)}", file=sys.stderr)
+        sys.exit(1)
+    for k, v in nice.items():
+        if not _which(k):
+            print(f"Note: {v} not found — some features may be limited.", file=sys.stderr)
+
+
+# ── Config ───────────────────────────────────────────────────────
+
+def load_config():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE) as f:
+                cfg = json.load(f)
+            for k, v in DEFAULT_CONFIG.items():
+                cfg.setdefault(k, v)
+            return cfg
+        except (json.JSONDecodeError, IOError):
+            pass
+    return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def resolve_filename(cfg, display_label=None):
+    now = datetime.now()
+    name = now.strftime(cfg["filename_template"])
+    if display_label:
+        name = name.replace("screenshot", f"screenshot-{display_label}")
+    ext = cfg["filetype"].lstrip(".")
+    return f"{name}.{ext}"
+
+
+def get_save_dir(cfg, force_ask=False):
+    if force_ask or cfg.get("ask_save_location"):
+        chosen = _ask_save_dir(cfg["save_dir"])
+        if chosen:
+            return chosen
+    d = Path(cfg["save_dir"])
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
+def _ask_save_dir(initial_dir):
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        d = filedialog.askdirectory(initialdir=initial_dir, title="Save screenshot to…")
+        root.destroy()
+        return d if d else None
+    except Exception:
+        return None
+
+
+# ── Cinnamon D-Bus helpers ───────────────────────────────────────
+
+def _cinnamon_eval(js_code):
+    try:
+        out = subprocess.check_output([
+            "dbus-send", "--session", "--print-reply",
+            "--dest=org.Cinnamon", "/org/Cinnamon",
+            "org.Cinnamon.Eval", f"string:{js_code}"
+        ], text=True, timeout=5)
+        success = "boolean true" in out
+        # Output: string ""<content>""
+        m = re.search(r'string\s+""(.*?)""$', out, re.DOTALL)
+        if m:
+            result = m.group(1)
+            result = result.replace('\\"', '"').replace('\\\\', '\\')
+        else:
+            m = re.search(r'string\s+"(.*)"$', out, re.DOTALL)
+            result = m.group(1) if m else ""
+            result = result.replace('\\"', '"').replace('\\\\', '\\')
+        return success, result
+    except Exception:
+        return False, ""
+
+
+def _has_cinnamon_eval():
+    try:
+        result = subprocess.run(
+            ["dbus-send", "--session", "--print-reply",
+             "--dest=org.Cinnamon", "/org/Cinnamon",
+             "org.freedesktop.DBus.Peer.Ping"],
+            capture_output=True, timeout=3
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _cinnamon_get_windows():
+    ok, result = _cinnamon_eval(
+        'let wins = [];'
+        'global.get_window_actors().forEach(a => {'
+        '  let w = a.get_meta_window();'
+        '  if (w.get_window_type() === 0) {'
+        '    let r = w.get_frame_rect();'
+        '    wins.push({title: w.get_title(), x: r.x, y: r.y, w: r.width, h: r.height});'
+        '  }'
+        '});'
+        'JSON.stringify(wins);'
+    )
+    if not ok or not result:
+        return []
+    try:
+        data = json.loads(result)
+        return [(w["title"], w) for w in data if w.get("title")]
+    except (json.JSONDecodeError, KeyError):
+        return []
+
+
+def _cinnamon_focus_window(title):
+    escaped = title.replace("\\", "\\\\").replace('"', '\\"')
+    js = (
+        'let w = global.get_window_actors().map(a => a.get_meta_window()).find('
+        f'  w => w.get_window_type() === 0 && w.get_title() === "{escaped}"'
+        ');'
+        'if (w) { w.activate(global.get_current_time()); "ok"; } else { "not found"; }'
+    )
+    ok, result = _cinnamon_eval(js)
+    return ok and "ok" in result
+
+
+# ── Theme / system dark mode detection ───────────────────────────
+
+THEMES = {
+    "dark": {
+        "bg": "#1e1e2e",
+        "fg": "#cdd6f4",
+        "bg2": "#313244",
+        "bg3": "#45475a",
+        "accent": "#89b4fa",
+        "accent_hover": "#74c7ec",
+        "btn_fg": "#1e1e2e",
+        "dim": "#6c7086",
+        "entry_bg": "#313244",
+        "entry_fg": "#cdd6f4",
+        "tab_bg": "#313244",
+        "tab_fg": "#a6adc8",
+        "tab_sel_bg": "#1e1e2e",
+        "tab_sel_fg": "#89b4fa",
+        "border": "#45475a",
+    },
+    "light": {
+        "bg": "#eff1f5",
+        "fg": "#4c4f69",
+        "bg2": "#e6e9ef",
+        "bg3": "#ccd0da",
+        "accent": "#1e66f5",
+        "accent_hover": "#2a7bde",
+        "btn_fg": "#ffffff",
+        "dim": "#8c8fa1",
+        "entry_bg": "#ffffff",
+        "entry_fg": "#4c4f69",
+        "tab_bg": "#e6e9ef",
+        "tab_fg": "#6c6f85",
+        "tab_sel_bg": "#eff1f5",
+        "tab_sel_fg": "#1e66f5",
+        "border": "#ccd0da",
+    },
+}
+
+
+def _detect_system_dark():
+    """Try to detect if the system is using a dark theme."""
+    # Method 1: gsettings (GNOME/Cinnamon)
+    for schema, key in [
+        ("org.cinnamon.desktop.interface", "gtk-theme"),
+        ("org.gnome.desktop.interface", "gtk-theme"),
+        ("org.gnome.desktop.interface", "color-scheme"),
+    ]:
+        try:
+            out = subprocess.check_output(
+                ["gsettings", "get", schema, key],
+                text=True, stderr=subprocess.DEVNULL, timeout=2
+            ).strip().strip("'\"")
+            lower = out.lower()
+            if "dark" in lower:
+                return True
+            if "light" in lower or "adwaita" == lower:
+                return False
+        except Exception:
+            pass
+    # Method 2: check GTK settings file
+    gtk_settings = Path.home() / ".config" / "gtk-3.0" / "settings.ini"
+    if gtk_settings.exists():
+        try:
+            text = gtk_settings.read_text()
+            if "prefer-dark" in text.lower() or "dark" in text.lower():
+                return True
+        except Exception:
+            pass
+    return True  # default to dark
+
+
+def _resolve_theme(cfg):
+    """Return 'dark' or 'light' based on config."""
+    theme = cfg.get("theme", "auto")
+    if theme == "auto":
+        return "dark" if _detect_system_dark() else "light"
+    return theme if theme in ("dark", "light") else "dark"
+
+
+def _apply_theme(root, style, theme_name):
+    """Apply dark or light theme to ttk widgets."""
+    t = THEMES[theme_name]
+
+    root.configure(bg=t["bg"])
+
+    style.theme_use("clam")
+
+    # General
+    style.configure(".", background=t["bg"], foreground=t["fg"],
+                     borderwidth=0, focuscolor=t["accent"])
+
+    # Frames
+    style.configure("TFrame", background=t["bg"])
+
+    # Labels
+    style.configure("TLabel", background=t["bg"], foreground=t["fg"])
+    style.configure("Dim.TLabel", background=t["bg"], foreground=t["dim"])
+    style.configure("Header.TLabel", background=t["bg"], foreground=t["fg"],
+                     font=("sans-serif", 12, "bold"))
+    style.configure("Backend.TLabel", background=t["bg"], foreground=t["dim"],
+                     font=("sans-serif", 9))
+
+    # Notebook (tabs)
+    style.configure("TNotebook", background=t["bg"], borderwidth=0)
+    style.configure("TNotebook.Tab",
+                     background=t["tab_bg"], foreground=t["tab_fg"],
+                     padding=(16, 8), font=("sans-serif", 10, "bold"),
+                     borderwidth=0)
+    style.map("TNotebook.Tab",
+              background=[("selected", t["tab_sel_bg"])],
+              foreground=[("selected", t["tab_sel_fg"])],
+              expand=[("selected", [0, 0, 0, 2])])
+
+    # Buttons — accent colored
+    style.configure("Accent.TButton",
+                     background=t["accent"], foreground=t["btn_fg"],
+                     padding=(12, 8), font=("sans-serif", 10),
+                     borderwidth=0)
+    style.map("Accent.TButton",
+              background=[("active", t["accent_hover"]),
+                          ("pressed", t["accent_hover"])])
+
+    # Regular buttons
+    style.configure("TButton",
+                     background=t["bg3"], foreground=t["fg"],
+                     padding=(10, 6), font=("sans-serif", 9),
+                     borderwidth=0)
+    style.map("TButton",
+              background=[("active", t["border"])])
+
+    # Entry
+    style.configure("TEntry",
+                     fieldbackground=t["entry_bg"], foreground=t["entry_fg"],
+                     insertcolor=t["fg"], borderwidth=1,
+                     relief="solid", padding=4)
+    style.map("TEntry",
+              bordercolor=[("focus", t["accent"]), ("!focus", t["border"])])
+
+    # Combobox
+    style.configure("TCombobox",
+                     fieldbackground=t["entry_bg"], foreground=t["entry_fg"],
+                     borderwidth=1, padding=4, arrowcolor=t["fg"])
+    style.map("TCombobox",
+              bordercolor=[("focus", t["accent"]), ("!focus", t["border"])],
+              fieldbackground=[("readonly", t["entry_bg"])])
+
+    # Checkbutton
+    style.configure("TCheckbutton",
+                     background=t["bg"], foreground=t["fg"],
+                     font=("sans-serif", 9))
+    style.map("TCheckbutton",
+              background=[("active", t["bg"])])
+
+    # Separator
+    style.configure("TSeparator", background=t["border"])
+
+    return t
+
+
+# ══════════════════════════════════════════════════════════════════
+#  X11 BACKEND
+# ══════════════════════════════════════════════════════════════════
+
+_EXCLUDED_CLASSES = {
+    "cinnamon", "csd-xsettings", "csd-background", "csd-media-keys",
+    "csd-power", "csd-clipboard", "csd-color", "csd-automount",
+    "csd-a11y-settings", "csd-datetime", "csd-housekeeping",
+    "csd-keyboard", "csd-mouse", "csd-orientation", "csd-print-notifications",
+    "csd-screensaver-proxy", "csd-smartcard", "csd-sound", "csd-wacom",
+    "csd-xrandr", "nemo-desktop", "mutter", "muffin",
+}
+_EXCLUDED_NAMES = {"muffin guard window", "mutter guard window", "desktop"}
+
+
+class X11Backend:
+
+    @staticmethod
+    def get_monitors():
+        out = subprocess.check_output(["xrandr", "--current"], text=True)
+        monitors = []
+        idx = 1
+        for line in out.splitlines():
+            m = re.search(
+                r"(\S+)\s+connected\s+(?:primary\s+)?(\d+)x(\d+)\+(\d+)\+(\d+)", line
+            )
+            if m:
+                monitors.append({
+                    "name": m.group(1),
+                    "w": int(m.group(2)), "h": int(m.group(3)),
+                    "x": int(m.group(4)), "y": int(m.group(5)),
+                    "index": idx,
+                })
+                idx += 1
+        return monitors
+
+    @staticmethod
+    def get_active_monitor(monitors):
+        try:
+            wid = subprocess.check_output(["xdotool", "getactivewindow"], text=True).strip()
+            geom = subprocess.check_output(
+                ["xdotool", "getwindowgeometry", "--shell", wid], text=True
+            )
+            vals = {}
+            for line in geom.strip().splitlines():
+                k, v = line.split("=", 1)
+                vals[k] = int(v)
+            wx, wy = vals.get("X", 0), vals.get("Y", 0)
+            for mon in monitors:
+                if (mon["x"] <= wx < mon["x"] + mon["w"] and
+                        mon["y"] <= wy < mon["y"] + mon["h"]):
+                    return mon
+        except Exception:
+            pass
+        return monitors[0] if monitors else None
+
+    @staticmethod
+    def capture_region(geometry, outpath, include_cursor=False):
+        cmd = ["maim", "-g", geometry]
+        if not include_cursor:
+            cmd.append("--hidecursor")
+        cmd.append(outpath)
+        subprocess.run(cmd, check=True)
+
+    @staticmethod
+    def capture_selection(outpath, include_cursor=False):
+        cmd = ["maim", "-s"]
+        if not include_cursor:
+            cmd.append("--hidecursor")
+        cmd.append(outpath)
+        subprocess.run(cmd, check=True)
+
+    @staticmethod
+    def capture_window(wid, outpath, include_cursor=False):
+        cmd = ["maim", "-i", str(wid)]
+        if not include_cursor:
+            cmd.append("--hidecursor")
+        cmd.append(outpath)
+        subprocess.run(cmd, check=True)
+
+    @staticmethod
+    def get_active_window_id():
+        return subprocess.check_output(["xdotool", "getactivewindow"], text=True).strip()
+
+    @staticmethod
+    def get_window_list():
+        try:
+            out = subprocess.check_output(["wmctrl", "-l"], text=True)
+            results = []
+            for line in out.strip().splitlines():
+                parts = line.split(None, 3)
+                if len(parts) >= 4 and parts[3]:
+                    title = parts[3]
+                    if title.lower() in _EXCLUDED_NAMES:
+                        continue
+                    wid_dec = int(parts[0], 16)
+                    results.append((str(wid_dec), title))
+            return results
+        except FileNotFoundError:
+            pass
+
+        out = subprocess.check_output(["xdotool", "search", "--name", ""], text=True)
+        results = []
+        for wid in out.strip().splitlines():
+            try:
+                name = subprocess.check_output(
+                    ["xdotool", "getwindowname", wid], text=True
+                ).strip()
+                if not name or name.lower() in _EXCLUDED_NAMES:
+                    continue
+                classname = subprocess.check_output(
+                    ["xdotool", "getwindowclassname", wid], text=True
+                ).strip()
+                if classname.lower() in _EXCLUDED_CLASSES or classname == "(null)":
+                    continue
+                results.append((wid, name))
+            except subprocess.CalledProcessError:
+                pass
+        return results
+
+
+# ══════════════════════════════════════════════════════════════════
+#  GNOME SHELL D-BUS BACKEND (Cinnamon-Wayland, GNOME-Wayland)
+# ══════════════════════════════════════════════════════════════════
+
+class PortalBackend:
+
+    @staticmethod
+    def get_monitors():
+        try:
+            return X11Backend.get_monitors()
+        except Exception:
+            return []
+
+    @staticmethod
+    def get_active_monitor(monitors):
+        try:
+            return X11Backend.get_active_monitor(monitors)
+        except Exception:
+            return monitors[0] if monitors else None
+
+    @staticmethod
+    def _dbus_screenshot(outpath):
+        subprocess.run([
+            "dbus-send", "--session", "--print-reply", "--type=method_call",
+            "--dest=org.gnome.Shell.Screenshot",
+            "/org/gnome/Shell/Screenshot",
+            "org.gnome.Shell.Screenshot.Screenshot",
+            "boolean:false", "boolean:false", f"string:{outpath}"
+        ], check=True, capture_output=True)
+
+    @staticmethod
+    def _dbus_screenshot_area(x, y, w, h, outpath):
+        subprocess.run([
+            "dbus-send", "--session", "--print-reply", "--type=method_call",
+            "--dest=org.gnome.Shell.Screenshot",
+            "/org/gnome/Shell/Screenshot",
+            "org.gnome.Shell.Screenshot.ScreenshotArea",
+            f"int32:{x}", f"int32:{y}", f"int32:{w}", f"int32:{h}",
+            "boolean:false", f"string:{outpath}"
+        ], check=True, capture_output=True)
+
+    @staticmethod
+    def _dbus_screenshot_window(include_cursor=False, outpath=""):
+        cursor_str = "true" if include_cursor else "false"
+        subprocess.run([
+            "dbus-send", "--session", "--print-reply", "--type=method_call",
+            "--dest=org.gnome.Shell.Screenshot",
+            "/org/gnome/Shell/Screenshot",
+            "org.gnome.Shell.Screenshot.ScreenshotWindow",
+            "boolean:true", f"boolean:{cursor_str}", "boolean:false",
+            f"string:{outpath}"
+        ], check=True, capture_output=True)
+
+    @staticmethod
+    def _dbus_select_area():
+        result = subprocess.check_output([
+            "dbus-send", "--session", "--print-reply", "--type=method_call",
+            "--dest=org.gnome.Shell.Screenshot",
+            "/org/gnome/Shell/Screenshot",
+            "org.gnome.Shell.Screenshot.SelectArea"
+        ], text=True)
+        ints = [int(m.group(1)) for m in re.finditer(r"int32\s+(\d+)", result)]
+        if len(ints) == 4:
+            return ints
+        return None
+
+    @classmethod
+    def capture_region(cls, mon, outpath, include_cursor=False):
+        cls._dbus_screenshot_area(mon["x"], mon["y"], mon["w"], mon["h"], outpath)
+
+    @classmethod
+    def capture_fullscreen(cls, outpath, include_cursor=False):
+        cls._dbus_screenshot(outpath)
+
+    @classmethod
+    def capture_selection(cls, outpath, include_cursor=False):
+        try:
+            area = cls._dbus_select_area()
+            if area:
+                cls._dbus_screenshot_area(area[0], area[1], area[2], area[3], outpath)
+                return
+        except Exception:
+            pass
+        if _which("maim"):
+            cmd = ["maim", "-s"]
+            if not include_cursor:
+                cmd.append("--hidecursor")
+            cmd.append(outpath)
+            subprocess.run(cmd, check=True)
+            return
+        print("Note: no interactive selection available, capturing full screen.",
+              file=sys.stderr)
+        cls._dbus_screenshot(outpath)
+
+    @classmethod
+    def capture_window(cls, outpath, include_cursor=False):
+        cls._dbus_screenshot_window(include_cursor, outpath)
+
+    @staticmethod
+    def get_window_list():
+        if _has_cinnamon_eval():
+            windows = _cinnamon_get_windows()
+            if windows:
+                return windows
+        return X11Backend.get_window_list()
+
+    @staticmethod
+    def get_active_window_id():
+        return X11Backend.get_active_window_id()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  WAYLAND BACKEND (wlroots: Sway, Hyprland, etc.)
+# ══════════════════════════════════════════════════════════════════
+
+class WaylandBackend:
+
+    @staticmethod
+    def _compositor():
+        if os.environ.get("SWAYSOCK"):
+            return "sway"
+        if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            return "hyprland"
+        return "generic"
+
+    @classmethod
+    def get_monitors(cls):
+        comp = cls._compositor()
+        if comp == "sway":
+            return cls._monitors_sway()
+        elif comp == "hyprland":
+            return cls._monitors_hyprland()
+        return cls._monitors_wlr_randr()
+
+    @staticmethod
+    def _monitors_sway():
+        out = subprocess.check_output(["swaymsg", "-t", "get_outputs", "-r"], text=True)
+        monitors = []
+        idx = 1
+        for o in json.loads(out):
+            if not o.get("active"):
+                continue
+            rect = o.get("rect", {})
+            monitors.append({
+                "name": o.get("name", f"output-{idx}"),
+                "w": rect.get("width", 0), "h": rect.get("height", 0),
+                "x": rect.get("x", 0), "y": rect.get("y", 0),
+                "index": idx,
+            })
+            idx += 1
+        return monitors
+
+    @staticmethod
+    def _monitors_hyprland():
+        out = subprocess.check_output(["hyprctl", "monitors", "-j"], text=True)
+        monitors = []
+        idx = 1
+        for o in json.loads(out):
+            monitors.append({
+                "name": o.get("name", f"output-{idx}"),
+                "w": o.get("width", 0), "h": o.get("height", 0),
+                "x": o.get("x", 0), "y": o.get("y", 0),
+                "index": idx,
+            })
+            idx += 1
+        return monitors
+
+    @staticmethod
+    def _monitors_wlr_randr():
+        try:
+            out = subprocess.check_output(["wlr-randr"], text=True)
+        except FileNotFoundError:
+            try:
+                return X11Backend.get_monitors()
+            except Exception:
+                print("Error: cannot enumerate monitors — install swaymsg, hyprctl, "
+                      "wlr-randr, or xrandr.", file=sys.stderr)
+                return []
+        monitors = []
+        idx = 1
+        current_name = None
+        for line in out.splitlines():
+            m = re.match(r"^(\S+)", line)
+            if m and not line.startswith(" "):
+                current_name = m.group(1)
+            m = re.search(r"(\d+)x(\d+)\s+px,.*?at\s+(\d+),(\d+)", line)
+            if m and current_name:
+                monitors.append({
+                    "name": current_name,
+                    "w": int(m.group(1)), "h": int(m.group(2)),
+                    "x": int(m.group(3)), "y": int(m.group(4)),
+                    "index": idx,
+                })
+                idx += 1
+                current_name = None
+        return monitors
+
+    @classmethod
+    def get_active_monitor(cls, monitors):
+        comp = cls._compositor()
+        try:
+            if comp == "sway":
+                out = subprocess.check_output(
+                    ["swaymsg", "-t", "get_outputs", "-r"], text=True
+                )
+                for o in json.loads(out):
+                    if o.get("focused"):
+                        for mon in monitors:
+                            if mon["name"] == o.get("name"):
+                                return mon
+            elif comp == "hyprland":
+                out = subprocess.check_output(
+                    ["hyprctl", "activeworkspace", "-j"], text=True
+                )
+                mon_name = json.loads(out).get("monitor")
+                for mon in monitors:
+                    if mon["name"] == mon_name:
+                        return mon
+        except Exception:
+            pass
+        return monitors[0] if monitors else None
+
+    @staticmethod
+    def capture_output(output_name, outpath, include_cursor=False):
+        cmd = ["grim"]
+        if include_cursor:
+            cmd.append("-c")
+        cmd.extend(["-o", output_name, outpath])
+        subprocess.run(cmd, check=True)
+
+    @staticmethod
+    def capture_selection(outpath, include_cursor=False):
+        region = subprocess.check_output(["slurp"], text=True).strip()
+        cmd = ["grim"]
+        if include_cursor:
+            cmd.append("-c")
+        cmd.extend(["-g", region, outpath])
+        subprocess.run(cmd, check=True)
+
+    @staticmethod
+    def capture_window_geom(geom, outpath, include_cursor=False):
+        cmd = ["grim"]
+        if include_cursor:
+            cmd.append("-c")
+        cmd.extend(["-g", geom, outpath])
+        subprocess.run(cmd, check=True)
+
+    @classmethod
+    def get_active_window_geometry(cls):
+        comp = cls._compositor()
+        try:
+            if comp == "sway":
+                out = subprocess.check_output(
+                    ["swaymsg", "-t", "get_tree", "-r"], text=True
+                )
+                node = cls._sway_find_focused(json.loads(out))
+                if node:
+                    r = node["rect"]
+                    return f"{r['x']},{r['y']} {r['width']}x{r['height']}"
+            elif comp == "hyprland":
+                out = subprocess.check_output(
+                    ["hyprctl", "activewindow", "-j"], text=True
+                )
+                w = json.loads(out)
+                at, sz = w.get("at", [0, 0]), w.get("size", [0, 0])
+                return f"{at[0]},{at[1]} {sz[0]}x{sz[1]}"
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def _sway_find_focused(cls, node):
+        if node.get("focused"):
+            return node
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            result = cls._sway_find_focused(child)
+            if result:
+                return result
+        return None
+
+    @classmethod
+    def get_window_list(cls):
+        comp = cls._compositor()
+        results = []
+        try:
+            if comp == "sway":
+                out = subprocess.check_output(
+                    ["swaymsg", "-t", "get_tree", "-r"], text=True
+                )
+                cls._sway_collect_windows(json.loads(out), results)
+            elif comp == "hyprland":
+                out = subprocess.check_output(
+                    ["hyprctl", "clients", "-j"], text=True
+                )
+                for w in json.loads(out):
+                    title = w.get("title", "")
+                    at, sz = w.get("at", [0, 0]), w.get("size", [0, 0])
+                    if title and sz[0] > 0:
+                        results.append((f"{at[0]},{at[1]} {sz[0]}x{sz[1]}", title))
+        except Exception:
+            pass
+        return results
+
+    @classmethod
+    def _sway_collect_windows(cls, node, results):
+        if node.get("type") == "con" and node.get("name"):
+            r = node.get("rect", {})
+            if r.get("width", 0) > 0:
+                results.append((f"{r['x']},{r['y']} {r['width']}x{r['height']}", node["name"]))
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            cls._sway_collect_windows(child, results)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  HIGH-LEVEL CAPTURE (backend-agnostic)
+# ══════════════════════════════════════════════════════════════════
+
+def _get_backend():
+    be = detect_backend()
+    if be == "wayland":
+        return WaylandBackend, "wayland"
+    elif be == "portal":
+        return PortalBackend, "portal"
+    return X11Backend, "x11"
+
+
+def _should_include_cursor(cfg, force_cursor):
+    if force_cursor:
+        return True
+    return cfg.get("include_cursor", False)
+
+
+def capture_all(cfg, force_ask, monitor_filter=None, active_only=False,
+                include_cursor=False):
+    be_cls, be_type = _get_backend()
+    cursor = _should_include_cursor(cfg, include_cursor)
+    monitors = be_cls.get_monitors()
+    if not monitors:
+        print("Error: no monitors detected.", file=sys.stderr)
+        return []
+
+    targets = monitors
+    if active_only:
+        am = be_cls.get_active_monitor(monitors)
+        targets = [am] if am else monitors[:1]
+    elif monitor_filter is not None:
+        indices = set(int(c) for c in str(monitor_filter) if c.isdigit())
+        targets = [m for m in monitors if m["index"] in indices]
+        if not targets:
+            print(f"Error: no monitors match indices {monitor_filter}.", file=sys.stderr)
+            return []
+
+    save_dir = get_save_dir(cfg, force_ask)
+    saved = []
+    for mon in targets:
+        label = f"disp{mon['index']}"
+        fname = resolve_filename(cfg, label)
+        outpath = os.path.join(save_dir, fname)
+        try:
+            if be_type == "wayland":
+                be_cls.capture_output(mon["name"], outpath, cursor)
+            elif be_type == "portal":
+                be_cls.capture_region(mon, outpath, cursor)
+            else:
+                geom = f"{mon['w']}x{mon['h']}+{mon['x']}+{mon['y']}"
+                be_cls.capture_region(geom, outpath, cursor)
+            saved.append(outpath)
+            print(f"Saved: {outpath}")
+        except subprocess.CalledProcessError as e:
+            print(f"Error capturing {label}: {e}", file=sys.stderr)
+    return saved
+
+
+def capture_portion(cfg, force_ask, include_cursor=False):
+    be_cls, be_type = _get_backend()
+    cursor = _should_include_cursor(cfg, include_cursor)
+    save_dir = get_save_dir(cfg, force_ask)
+    fname = resolve_filename(cfg)
+    outpath = os.path.join(save_dir, fname)
+    try:
+        be_cls.capture_selection(outpath, cursor)
+        print(f"Saved: {outpath}")
+        return [outpath]
+    except subprocess.CalledProcessError:
+        print("Selection cancelled.", file=sys.stderr)
+        return []
+
+
+def capture_window(cfg, force_ask, use_current=False, include_cursor=False):
+    be_cls, be_type = _get_backend()
+    cursor = _should_include_cursor(cfg, include_cursor)
+
+    if be_type == "portal":
+        return _capture_window_portal(be_cls, cfg, force_ask, use_current, cursor)
+    elif be_type == "wayland":
+        return _capture_window_wayland(be_cls, cfg, force_ask, use_current, cursor)
+    return _capture_window_x11(be_cls, cfg, force_ask, use_current, cursor)
+
+
+def _capture_window_portal(be_cls, cfg, force_ask, use_current, cursor):
+    save_dir = get_save_dir(cfg, force_ask)
+    fname = resolve_filename(cfg)
+    outpath = os.path.join(save_dir, fname)
+
+    if use_current:
+        try:
+            be_cls.capture_window(outpath, cursor)
+            print(f"Saved: {outpath}")
+            return [outpath]
+        except subprocess.CalledProcessError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return []
+
+    windows = be_cls.get_window_list()
+    if not windows:
+        print("No windows found.", file=sys.stderr)
+        return []
+
+    picked_title = _pick_window_gui_portal(windows)
+    if picked_title is None:
+        print("No window selected.", file=sys.stderr)
+        return []
+
+    if _has_cinnamon_eval():
+        _cinnamon_focus_window(picked_title)
+    time.sleep(0.3)
+
+    try:
+        be_cls.capture_window(outpath, cursor)
+        print(f"Saved: {outpath}")
+        return [outpath]
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return []
+
+
+def _capture_window_x11(be_cls, cfg, force_ask, use_current, cursor):
+    if use_current:
+        try:
+            wid = be_cls.get_active_window_id()
+        except subprocess.CalledProcessError:
+            print("Error: could not determine active window.", file=sys.stderr)
+            return []
+    else:
+        windows = be_cls.get_window_list()
+        wid = _pick_window_gui_x11(windows)
+        if wid is None:
+            print("No window selected.", file=sys.stderr)
+            return []
+
+    save_dir = get_save_dir(cfg, force_ask)
+    fname = resolve_filename(cfg)
+    outpath = os.path.join(save_dir, fname)
+    try:
+        be_cls.capture_window(wid, outpath, cursor)
+        print(f"Saved: {outpath}")
+        return [outpath]
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return []
+
+
+def _capture_window_wayland(be_cls, cfg, force_ask, use_current, cursor):
+    if use_current:
+        geom = be_cls.get_active_window_geometry()
+        if not geom:
+            print("Error: could not determine active window geometry.", file=sys.stderr)
+            return []
+    else:
+        windows = be_cls.get_window_list()
+        geom = _pick_window_gui_wayland(windows)
+        if geom is None:
+            print("No window selected.", file=sys.stderr)
+            return []
+
+    save_dir = get_save_dir(cfg, force_ask)
+    fname = resolve_filename(cfg)
+    outpath = os.path.join(save_dir, fname)
+    try:
+        be_cls.capture_window_geom(geom, outpath, cursor)
+        print(f"Saved: {outpath}")
+        return [outpath]
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return []
+
+
+# ── Window picker GUIs ───────────────────────────────────────────
+
+def _window_picker_tk(display_names):
+    """Shared tkinter picker. Returns selected index or None."""
+    if not display_names:
+        return None
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+    except ImportError:
+        print("Error: tkinter is required for window selection GUI.", file=sys.stderr)
+        return None
+
+    chosen = [None]
+
+    existing_root = getattr(tk, '_default_root', None)
+    if existing_root:
+        win = tk.Toplevel(existing_root)
+    else:
+        existing_root = tk.Tk()
+        existing_root.withdraw()
+        win = tk.Toplevel(existing_root)
+
+    win.title("qlip — Select Window")
+    win.geometry("500x150")
+    win.resizable(False, False)
+    win.attributes("-topmost", True)
+    win.grab_set()
+    win.protocol("WM_DELETE_WINDOW", win.destroy)
+
+    tk.Label(win, text="Select a window to capture:").pack(pady=(12, 4))
+    combo = ttk.Combobox(win, state="readonly", width=65)
+    combo["values"] = display_names
+    combo.current(0)
+    combo.pack(pady=4)
+
+    def on_ok():
+        chosen[0] = combo.current()
+        win.destroy()
+
+    btn_frame = tk.Frame(win)
+    btn_frame.pack(pady=10)
+    tk.Button(btn_frame, text="Capture", command=on_ok, width=12).pack(side="left", padx=6)
+    tk.Button(btn_frame, text="Cancel", command=win.destroy, width=12).pack(side="left", padx=6)
+
+    win.wait_window()
+    return chosen[0]
+
+
+def _pick_window_gui_portal(windows):
+    """Portal backend: windows are [(title, rect_dict), ...]. Returns title or None."""
+    names = []
+    for title, _ in windows:
+        parts = title.rsplit(" - ", 1)
+        if len(parts) == 2:
+            names.append(f"{parts[1]} - {parts[0]}")
+        else:
+            names.append(title)
+    idx = _window_picker_tk(names)
+    if idx is None:
+        return None
+    return windows[idx][0]
+
+
+def _pick_window_gui_x11(windows):
+    names = [title for _, title in windows]
+    idx = _window_picker_tk(names)
+    if idx is None:
+        return None
+    return windows[idx][0]
+
+
+def _pick_window_gui_wayland(windows):
+    names = [title for _, title in windows]
+    idx = _window_picker_tk(names)
+    if idx is None:
+        return None
+    return windows[idx][0]
+
+
+# ── GUI ──────────────────────────────────────────────────────────
+
+def run_gui():
+    try:
+        import tkinter as tk
+        from tkinter import ttk, filedialog, messagebox
+    except ImportError:
+        print("Error: tkinter is required for the GUI.", file=sys.stderr)
+        sys.exit(1)
+
+    cfg = load_config()
+    be_name = detect_backend()
+    session_label = {"wayland": "Wayland (grim)", "portal": "Wayland (D-Bus portal)",
+                     "x11": "X11"}[be_name]
+
+    root = tk.Tk()
+    root.title("qlip")
+    root.geometry("540x520")
+    root.resizable(False, False)
+
+    style = ttk.Style(root)
+    theme_name = _resolve_theme(cfg)
+    t = _apply_theme(root, style, theme_name)
+
+    # ── Header bar ───────────────────────────────────────────────
+    header = tk.Frame(root, bg=t["bg2"], height=48)
+    header.pack(fill="x")
+    header.pack_propagate(False)
+
+    tk.Label(header, text="  qlip", font=("sans-serif", 14, "bold"),
+             bg=t["bg2"], fg=t["accent"]).pack(side="left", padx=8, pady=8)
+    tk.Label(header, text="screenshot utility", font=("sans-serif", 9),
+             bg=t["bg2"], fg=t["dim"]).pack(side="left", pady=8)
+
+    # ── Notebook ─────────────────────────────────────────────────
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True, padx=12, pady=(8, 12))
+
+    # ── Usage tab ────────────────────────────────────────────────
+    usage_frame = ttk.Frame(notebook, padding=20)
+    notebook.add(usage_frame, text="  Capture  ")
+
+    def gui_capture_all():
+        root.withdraw(); time.sleep(0.3)
+        try:
+            capture_all(cfg, False)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+        root.deiconify()
+
+    def gui_capture_portion():
+        root.withdraw(); time.sleep(0.3)
+        try:
+            capture_portion(cfg, False)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+        root.deiconify()
+
+    def gui_capture_window():
+        root.withdraw(); time.sleep(0.3)
+        try:
+            capture_window(cfg, False, use_current=False)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+        root.deiconify()
+
+    ttk.Label(usage_frame, text="Take a screenshot",
+              style="Header.TLabel").pack(anchor="w", pady=(0, 16))
+
+    for label_text, cmd in [
+        ("Capture All Monitors", gui_capture_all),
+        ("Select Region", gui_capture_portion),
+        ("Select Window", gui_capture_window),
+    ]:
+        ttk.Button(usage_frame, text=label_text, command=cmd,
+                   style="Accent.TButton", width=30).pack(pady=5, anchor="w")
+
+    spacer = ttk.Frame(usage_frame)
+    spacer.pack(fill="both", expand=True)
+
+    ttk.Label(usage_frame, text=f"Backend: {session_label}",
+              style="Backend.TLabel").pack(anchor="w")
+
+    # ── Settings tab ─────────────────────────────────────────────
+    sf = ttk.Frame(notebook, padding=20)
+    notebook.add(sf, text="  Settings  ")
+
+    ttk.Label(sf, text="Configuration",
+              style="Header.TLabel").grid(row=0, column=0, columnspan=3,
+                                           sticky="w", pady=(0, 12))
+
+    row = 1
+    ttk.Label(sf, text="Save location:").grid(row=row, column=0, sticky="w", pady=6)
+    dir_var = tk.StringVar(value=cfg["save_dir"])
+    ttk.Entry(sf, textvariable=dir_var, width=32).grid(row=row, column=1, pady=6, padx=(8, 4))
+
+    def browse_dir():
+        d = filedialog.askdirectory(initialdir=dir_var.get())
+        if d:
+            dir_var.set(d)
+
+    ttk.Button(sf, text="Browse", command=browse_dir).grid(row=row, column=2, pady=6, padx=4)
+
+    row += 1
+    ask_var = tk.BooleanVar(value=cfg["ask_save_location"])
+    ttk.Checkbutton(sf, text="Ask where to save each screenshot",
+                    variable=ask_var).grid(row=row, column=0, columnspan=3,
+                                            sticky="w", pady=4)
+
+    row += 1
+    cursor_var = tk.BooleanVar(value=cfg["include_cursor"])
+    ttk.Checkbutton(sf, text="Include cursor in screenshots",
+                    variable=cursor_var).grid(row=row, column=0, columnspan=3,
+                                               sticky="w", pady=4)
+
+    row += 1
+    ttk.Separator(sf, orient="horizontal").grid(row=row, column=0, columnspan=3,
+                                                  sticky="ew", pady=10)
+
+    row += 1
+    ttk.Label(sf, text="Filetype:").grid(row=row, column=0, sticky="w", pady=6)
+    ft_var = tk.StringVar(value=cfg["filetype"])
+    ttk.Combobox(sf, textvariable=ft_var, values=["png", "jpg", "jpeg", "bmp"],
+                 state="readonly", width=8).grid(row=row, column=1, sticky="w",
+                                                   pady=6, padx=8)
+
+    row += 1
+    ttk.Label(sf, text="Filename:").grid(row=row, column=0, sticky="w", pady=6)
+    fn_var = tk.StringVar(value=cfg["filename_template"])
+    ttk.Entry(sf, textvariable=fn_var, width=32).grid(
+        row=row, column=1, columnspan=2, sticky="w", pady=6, padx=8)
+
+    row += 1
+    ttk.Label(sf, text="%Y year  %m month  %B name  %d day  %H hr  %M min  %S sec",
+              style="Dim.TLabel").grid(row=row, column=0, columnspan=3, sticky="w")
+
+    row += 1
+    preview_var = tk.StringVar()
+
+    def update_preview(*_):
+        now = datetime.now()
+        try:
+            rendered = now.strftime(fn_var.get())
+        except Exception:
+            rendered = "(invalid)"
+        preview_var.set(f"{rendered}.{ft_var.get().lstrip('.')}")
+
+    fn_var.trace_add("write", update_preview)
+    ft_var.trace_add("write", update_preview)
+    update_preview()
+
+    ttk.Label(sf, textvariable=preview_var,
+              font=("monospace", 9), style="Dim.TLabel").grid(
+        row=row, column=0, columnspan=3, sticky="w", pady=(2, 8))
+
+    row += 1
+    ttk.Separator(sf, orient="horizontal").grid(row=row, column=0, columnspan=3,
+                                                  sticky="ew", pady=10)
+
+    row += 1
+    ttk.Label(sf, text="Theme:").grid(row=row, column=0, sticky="w", pady=6)
+    theme_var = tk.StringVar(value=cfg.get("theme", "auto"))
+    theme_combo = ttk.Combobox(sf, textvariable=theme_var,
+                                values=["auto", "dark", "light"],
+                                state="readonly", width=8)
+    theme_combo.grid(row=row, column=1, sticky="w", pady=6, padx=8)
+
+    current_theme_label = tk.StringVar(
+        value=f"(currently: {theme_name})" if theme_var.get() == "auto" else "")
+    ttk.Label(sf, textvariable=current_theme_label,
+              style="Dim.TLabel").grid(row=row, column=2, sticky="w")
+
+    def on_theme_change(*_):
+        v = theme_var.get()
+        if v == "auto":
+            current_theme_label.set(f"(detected: {_resolve_theme({'theme': 'auto'})})")
+        else:
+            current_theme_label.set("")
+
+    theme_var.trace_add("write", on_theme_change)
+
+    row += 1
+    row += 1
+    def apply_settings():
+        cfg["save_dir"] = dir_var.get()
+        cfg["ask_save_location"] = ask_var.get()
+        cfg["include_cursor"] = cursor_var.get()
+        cfg["filetype"] = ft_var.get()
+        cfg["filename_template"] = fn_var.get()
+        cfg["theme"] = theme_var.get()
+        save_config(cfg)
+        new_theme = _resolve_theme(cfg)
+        if new_theme != theme_name:
+            messagebox.showinfo("qlip", "Settings saved. Restart qlip to apply new theme.")
+        else:
+            messagebox.showinfo("qlip", "Settings saved.")
+
+    ttk.Button(sf, text="Save Settings", command=apply_settings,
+               style="Accent.TButton").grid(row=row, column=0, columnspan=3, pady=(8, 0),
+                                              sticky="w")
+
+    root.mainloop()
+
+
+# ── CLI entry ────────────────────────────────────────────────────
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "gui":
+        check_deps()
+        run_gui()
+        return
+
+    parser = argparse.ArgumentParser(
+        prog="qlip",
+        description="Lightweight screenshot utility (X11 + Wayland).",
+        epilog="Run 'qlip gui' to open the graphical interface.",
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("-a", action="store_true", help="Capture entire screen (all monitors)")
+    mode.add_argument("-p", action="store_true", help="Select a rectangular region to capture")
+    mode.add_argument("-w", action="store_true", help="Capture a specific window")
+
+    parser.add_argument("-m", nargs="?", const="active", default=None,
+                        help="With -a: no arg = active monitor; digits = specific indices")
+    parser.add_argument("-c", action="store_true",
+                        help="With -w: capture active window without prompting")
+    parser.add_argument("-s", action="store_true",
+                        help="Prompt for save location (one-time)")
+    parser.add_argument("-i", action="store_true",
+                        help="Include cursor in screenshot (overrides config)")
+
+    args = parser.parse_args()
+    check_deps()
+    cfg = load_config()
+
+    if args.a:
+        if args.m == "active":
+            capture_all(cfg, args.s, active_only=True, include_cursor=args.i)
+        elif args.m is not None:
+            capture_all(cfg, args.s, monitor_filter=args.m, include_cursor=args.i)
+        else:
+            capture_all(cfg, args.s, include_cursor=args.i)
+    elif args.p:
+        capture_portion(cfg, args.s, include_cursor=args.i)
+    elif args.w:
+        capture_window(cfg, args.s, use_current=args.c, include_cursor=args.i)
+
+
+if __name__ == "__main__":
+    main()
